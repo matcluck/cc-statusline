@@ -42,6 +42,20 @@ WORKTREE_NAME=$(j '.worktree.name')
 WORKTREE_BRANCH=$(j '.worktree.branch')
 EXCEEDS_200K=$(jn '.exceeds_200k_tokens')
 
+# ── Terminal width / narrow mode detection ──────────────────
+# Claude Code does not pass width in JSON and does not export $COLUMNS to the
+# statusline command, and the script has no controlling TTY. Inside tmux we can
+# ask tmux directly for the pane width – that is the actual rendering width.
+COLS=0
+if [[ -n "${TMUX:-}" && -n "${TMUX_PANE:-}" ]]; then
+  COLS=$(tmux display-message -p -t "$TMUX_PANE" '#{pane_width}' 2>/dev/null || echo 0)
+fi
+[[ "${COLS:-0}" =~ ^[0-9]+$ ]] || COLS=0
+(( COLS <= 0 )) && COLS=${COLUMNS:-0}
+(( COLS <= 0 )) && COLS=$(tput cols 2>/dev/null || echo 120)
+NARROW=0
+(( COLS < 100 )) && NARROW=1
+
 # ── Pre-expanded ANSI codes (safe for printf %s) ────────────
 fg()  { printf '\x1b[38;2;%d;%d;%dm' "$1" "$2" "$3"; }
 RST=$'\x1b[0m'
@@ -77,6 +91,40 @@ pbar() {
   if (( pct >= 90 )); then bar_color="$C_RED"
   elif (( pct >= 75 )); then bar_color="$C_ORANGE"
   elif (( pct >= 50 )); then bar_color="$C_YELLOW"
+  else bar_color="$C_GREEN"; fi
+
+  local fill_str pad_str
+  if [[ "$style" == "dots" ]]; then
+    printf -v fill_str "%${filled}s"; printf -v pad_str "%${empty}s"
+    printf '%s%s%s%s%s' "$bar_color" "${fill_str// /●}" "$C_DIM" "${pad_str// /○}" "$RST"
+  else
+    printf -v fill_str "%${filled}s"; printf -v pad_str "%${empty}s"
+    printf '%s%s%s%s%s' "$bar_color" "${fill_str// /█}" "$C_DIM" "${pad_str// /░}" "$RST"
+  fi
+}
+
+pct_remaining() {
+  local used=${1:-0}
+  used=${used%%.*}
+  (( used < 0 )) && used=0
+  (( used > 100 )) && used=100
+  printf '%d' "$((100 - used))"
+}
+
+pbar_remaining() {
+  local pct=${1:-0} width=${2:-10} style=${3:-block}
+  pct=${pct%%.*}
+  (( pct < 0 )) && pct=0
+  (( pct > 100 )) && pct=100
+  local filled=$(( (pct * width + 50) / 100 ))
+  (( filled > width )) && filled=$width
+  (( filled < 0 )) && filled=0
+  local empty=$((width - filled))
+
+  local bar_color
+  if (( pct <= 10 )); then bar_color="$C_RED"
+  elif (( pct <= 25 )); then bar_color="$C_ORANGE"
+  elif (( pct <= 50 )); then bar_color="$C_YELLOW"
   else bar_color="$C_GREEN"; fi
 
   local fill_str pad_str
@@ -343,22 +391,43 @@ LINES_SEG=""
 (( LINES_ADD > 0 || LINES_DEL > 0 )) && LINES_SEG=" ${C_DIM}│${RST} ${C_GREEN}+${LINES_ADD}${RST} ${C_RED}-${LINES_DEL}${RST}"
 
 # ── Rate limits ──────────────────────────────────────────────
-RATE_SEG=""
+# Color helper for compact remaining % (narrow mode).
+remaining_color() {
+  local p=$1
+  if (( p <= 10 )); then printf '%s' "$C_RED"
+  elif (( p <= 25 )); then printf '%s' "$C_ORANGE"
+  elif (( p <= 50 )); then printf '%s' "$C_YELLOW"
+  else printf '%s' "$C_GREEN"; fi
+}
+
+RATE_SEG=""           # rich – with progress bar + reset countdown
+RATE_SEG_COMPACT=""   # compact – just label + colored %
+RL5_INT=""; RL7_INT=""
 if [[ -n "$RL_5H_PCT" ]]; then
   RL5_INT=${RL_5H_PCT%%.*}
-  RL5_BAR=$(pbar "$RL5_INT" 8 dots)
+  RL5_LEFT=$(pct_remaining "$RL5_INT")
+  RL5_BAR=$(pbar_remaining "$RL5_LEFT" 8 dots)
   RL5_RESET=$(fmt_reset_time "$RL_5H_RESET")
-  RATE_SEG="${C_WHITE}5h${RST} ${RL5_BAR} ${C_BRIGHT}${RL5_INT}%${RST}"
+  RATE_SEG="${C_WHITE}5h${RST} ${RL5_BAR} ${C_BRIGHT}${RL5_LEFT}% left${RST}"
   [[ -n "$RL5_RESET" ]] && RATE_SEG="${RATE_SEG} ${C_DIM}⟳${RL5_RESET}${RST}"
+  c=$(remaining_color "$RL5_LEFT")
+  RATE_SEG_COMPACT="${C_WHITE}5h${RST} ${c}${BOLD}${RL5_LEFT}% left${RST}"
 fi
 if [[ -n "$RL_7D_PCT" ]]; then
   RL7_INT=${RL_7D_PCT%%.*}
-  RL7_BAR=$(pbar "$RL7_INT" 8 dots)
+  RL7_LEFT=$(pct_remaining "$RL7_INT")
+  RL7_BAR=$(pbar_remaining "$RL7_LEFT" 8 dots)
   RL7_RESET=$(fmt_reset_time "$RL_7D_RESET")
   [[ -n "$RATE_SEG" ]] && RATE_SEG="${RATE_SEG} ${C_DIM}│${RST} "
-  RATE_SEG="${RATE_SEG}${C_WHITE}7d${RST} ${RL7_BAR} ${C_BRIGHT}${RL7_INT}%${RST}"
+  RATE_SEG="${RATE_SEG}${C_WHITE}7d${RST} ${RL7_BAR} ${C_BRIGHT}${RL7_LEFT}% left${RST}"
   [[ -n "$RL7_RESET" ]] && RATE_SEG="${RATE_SEG} ${C_DIM}⟳${RL7_RESET}${RST}"
+  c=$(remaining_color "$RL7_LEFT")
+  [[ -n "$RATE_SEG_COMPACT" ]] && RATE_SEG_COMPACT="${RATE_SEG_COMPACT} "
+  RATE_SEG_COMPACT="${RATE_SEG_COMPACT}${C_WHITE}7d${RST} ${c}${BOLD}${RL7_LEFT}% left${RST}"
 fi
+
+# Compact ctx (no bar) for narrow mode.
+CTX_SEG_COMPACT="${C_WHITE}ctx${RST} ${C_BRIGHT}${BOLD}${CTX_USED}%${RST}${CTX_WARN}"
 
 # ── Version ──────────────────────────────────────────────────
 VER_SEG="${C_DIM}v${VERSION}${RST}"
@@ -367,12 +436,23 @@ VER_SEG="${C_DIM}v${VERSION}${RST}"
 # ── Assemble (printf %s – no escape interpretation on data) ──
 # ═══════════════════════════════════════════════════════════════
 
-# Line 1: Model │ Session │ Dir │ Git │ Worktree │ Vim │ Version
-L1="${MODEL_SEG}${SESSION_SEG}${WORKTREE_SEG} ${C_DIM}│${RST} ${DIR_SEG} ${GIT_SEG}${VIM_SEG} ${C_DIM}│${RST} ${VER_SEG}"
+if (( NARROW )); then
+  # ── Narrow mode (half-width tmux pane etc.) ──
+  # Trim L1 to the load-bearing bits; drop session name, worktree, vim, version.
+  L1="${MODEL_SEG} ${C_DIM}│${RST} ${DIR_SEG} ${GIT_SEG}"
 
-# Line 2: Context │ Tokens │ Cache │ Cost │ Time │ Lines │ Rate limits
-L2="${CTX_SEG} ${TOK_SEG}${TOK_SPEED_SEG}${CACHE_SEG} ${C_DIM}│${RST} ${COST_SEG} ${TIME_SEG}${LINES_SEG}"
-[[ -n "$RATE_SEG" ]] && L2="${L2} ${C_DIM}│${RST} ${RATE_SEG}"
+  # L2 leads with rate limits so "API left" is never clipped, then ctx + tokens + cost.
+  L2=""
+  [[ -n "$RATE_SEG_COMPACT" ]] && L2="${RATE_SEG_COMPACT} ${C_DIM}│${RST} "
+  L2="${L2}${CTX_SEG_COMPACT} ${C_DIM}│${RST} ${C_BLUE}↓${TOK_IN_FMT}${RST} ${C_PURPLE}↑${TOK_OUT_FMT}${RST} ${C_DIM}│${RST} ${C_YELLOW}💰 ${COST_FMT}${RST}"
+else
+  # Line 1: Model │ Session │ Dir │ Git │ Worktree │ Vim │ Version
+  L1="${MODEL_SEG}${SESSION_SEG}${WORKTREE_SEG} ${C_DIM}│${RST} ${DIR_SEG} ${GIT_SEG}${VIM_SEG} ${C_DIM}│${RST} ${VER_SEG}"
+
+  # Line 2: Context │ Tokens │ Cache │ Cost │ Time │ Lines │ Rate limits
+  L2="${CTX_SEG} ${TOK_SEG}${TOK_SPEED_SEG}${CACHE_SEG} ${C_DIM}│${RST} ${COST_SEG} ${TIME_SEG}${LINES_SEG}"
+  [[ -n "$RATE_SEG" ]] && L2="${L2} ${C_DIM}│${RST} ${RATE_SEG}"
+fi
 
 # Line 3 (conditional): Running agents │ Task progress
 L3=""

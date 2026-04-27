@@ -13,7 +13,7 @@ A rich, informative statusline for [Claude Code](https://docs.anthropic.com/en/d
 - **Git integration** -- branch, staged/unstaged/untracked counts, ahead/behind remote
 - **Agent tracking** -- live count of running subagents with type icons and descriptions
 - **Task progress** -- dot-style progress bar for TaskCreate/TaskUpdate activity
-- **Rate limits** -- 5-hour and 7-day usage with progress bars and reset countdowns
+- **Rate limits** -- 5-hour and 7-day remaining budget with progress bars and reset countdowns
 - **Session/worktree** -- session name and worktree info when active
 - **Vim mode** -- displays current vim mode (Normal/Insert) when enabled
 - **Lines changed** -- additions and deletions in the current session
@@ -34,19 +34,43 @@ ctx ████████░░░░ 65% │ ↓12.3k ↑4.2k (45 tok/s) │
 
 ## Installation
 
-### 1. Configure the statusline command
+Run the installer from this checkout:
+
+```bash
+./install.sh
+```
+
+The installer updates `~/.claude/settings.json`, preserves the rest of the file,
+and writes a timestamped backup beside it before changing anything.
+
+To preview the settings change without writing it:
+
+```bash
+./install.sh --dry-run
+```
+
+To install into a non-default settings file:
+
+```bash
+./install.sh --settings /path/to/settings.json
+```
+
+After installing, restart Claude Code or trigger a statusline refresh.
+
+### Manual Configuration
 
 Add the following to your Claude Code settings (`~/.claude/settings.json`):
 
 ```json
 {
-  "statusline": {
-    "command": "/path/to/statusline-command.sh"
+  "statusLine": {
+    "type": "command",
+    "command": "bash /path/to/statusline-command.sh"
   }
 }
 ```
 
-### 2. Enable agent tracking (optional)
+### Enable Agent Tracking (Optional)
 
 To track running agents and task progress, add hooks that log tool activity. Add to your Claude Code settings:
 
