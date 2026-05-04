@@ -22,7 +22,6 @@ VERSION=$(j '.version')
 SESSION_ID=$(j '.session_id')
 SESSION_NAME=$(j '.session_name')
 TRANSCRIPT=$(j '.transcript_path')
-COST=$(jn '.cost.total_cost_usd')
 DURATION_MS=$(ji '.cost.total_duration_ms')
 API_MS=$(ji '.cost.total_api_duration_ms')
 LINES_ADD=$(ji '.cost.total_lines_added')
@@ -192,7 +191,8 @@ for f in "$HOME/.claude"/tool-activity-*.log; do
   if kill -0 "$pid" 2>/dev/null; then
     [[ "$(cat /proc/$pid/comm 2>/dev/null)" == "node" ]] && continue
   fi
-  rm -f "$f" "$HOME/.claude/tool-activity-${pid}.session" 2>/dev/null
+  rm -f "$f" "$HOME/.claude/tool-activity-${pid}.session" \
+        "$HOME/.claude/.hook-status-${pid}" 2>/dev/null
 done
 
 if [[ -f "$ACTIVITY_LOG" ]]; then
@@ -267,6 +267,9 @@ fi
 
 # ── Subagent files (if transcript path available) ────────────
 SUBAGENT_EXTRA=""
+SUB_IN=0
+SUB_OUT=0
+SUB_COUNT=0
 if [[ -n "$TRANSCRIPT" && -d "${TRANSCRIPT%.jsonl}/subagents" ]]; then
   subagent_dir="${TRANSCRIPT%.jsonl}/subagents"
   meta_count=$(find "$subagent_dir" -name '*.meta.json' 2>/dev/null | wc -l)
@@ -274,7 +277,28 @@ if [[ -n "$TRANSCRIPT" && -d "${TRANSCRIPT%.jsonl}/subagents" ]]; then
     # Fallback: show total spawned agents from metadata if hook log didn't catch them
     SUBAGENT_EXTRA=" ${C_DIM}(${meta_count} spawned)${RST}"
   fi
+
+  # Sum token usage across every subagent transcript belonging to this session
+  # (recursive find – handles sub-subagents nested under deeper subagents/ dirs).
+  # Per-instance scoping is automatic: each Claude session has its own
+  # transcript path so we only walk this session's subagent tree.
+  SUB_COUNT=$(find "$subagent_dir" -name '*.jsonl' -type f 2>/dev/null | wc -l)
+  if (( SUB_COUNT > 0 )); then
+    sums=$(find "$subagent_dir" -name '*.jsonl' -type f -print0 2>/dev/null \
+      | xargs -0 -r cat 2>/dev/null \
+      | jq -r 'select(.type=="assistant" and .message.usage)
+          | "\(((.message.usage.input_tokens // 0) + (.message.usage.cache_creation_input_tokens // 0) + (.message.usage.cache_read_input_tokens // 0))) \(.message.usage.output_tokens // 0)"' 2>/dev/null \
+      | awk 'BEGIN{i=0;o=0} {i+=$1; o+=$2} END{print i, o}')
+    if [[ -n "$sums" ]]; then
+      read -r SUB_IN SUB_OUT <<<"$sums"
+      SUB_IN=${SUB_IN:-0}; SUB_OUT=${SUB_OUT:-0}
+    fi
+  fi
 fi
+
+# Combine main + subagent token totals.
+TOT_IN_ALL=$((TOT_IN + SUB_IN))
+TOT_OUT_ALL=$((TOT_OUT + SUB_OUT))
 
 # ── Git info ─────────────────────────────────────────────────
 GIT_BRANCH="" GIT_DIRTY="" GIT_AHEAD="" GIT_BEHIND=""
@@ -314,6 +338,42 @@ elif (( CTX_SIZE >= 200000 )); then CTX_BADGE=" 200k"; fi
 
 MODEL_SEG="${C_PURPLE}${BOLD}${MODEL_ICON} ${MODEL}${RST}${C_DIM}${CTX_BADGE}${RST}"
 
+# ── Caveman mode badge ───────────────────────────────────────
+CAVEMAN_SEG=""
+_CAVEMAN_FLAG="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/.caveman-active"
+if [[ -f "$_CAVEMAN_FLAG" && ! -L "$_CAVEMAN_FLAG" ]]; then
+  _cmode=$(head -c 64 "$_CAVEMAN_FLAG" 2>/dev/null | tr -d '\n\r' | tr '[:upper:]' '[:lower:]')
+  _cmode=$(printf '%s' "$_cmode" | tr -cd 'a-z0-9-')
+  case "$_cmode" in
+    off) ;;
+    lite|full|ultra|wenyan-lite|wenyan|wenyan-full|wenyan-ultra|commit|review|compress|"")
+      C_CAVE=$(fg 230 140 40)
+      if [[ -z "$_cmode" || "$_cmode" == "full" ]]; then
+        CAVEMAN_SEG=" ${C_CAVE}[CAVEMAN]${RST}"
+      else
+        _CSUF=$(printf '%s' "$_cmode" | tr '[:lower:]' '[:upper:]')
+        CAVEMAN_SEG=" ${C_CAVE}[CAVEMAN:${_CSUF}]${RST}"
+      fi
+      # Savings suffix written by /caveman-stats — absent until first run
+      _SAVINGS_FILE="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/.caveman-statusline-suffix"
+      if [[ -f "$_SAVINGS_FILE" && ! -L "$_SAVINGS_FILE" ]]; then
+        _savings=$(head -c 64 "$_SAVINGS_FILE" 2>/dev/null | tr -d '\000-\037')
+        [[ -n "$_savings" ]] && CAVEMAN_SEG="${CAVEMAN_SEG} ${C_CAVE}${_savings}${RST}"
+      fi
+      ;;
+  esac
+fi
+
+# ── Hook status badges (written by UserPromptSubmit hooks) ───────────────────
+# Hooks write ~/.claude/.hook-status-$PPID with a short display string.
+# This section is generic — the hook controls what text is shown.
+HOOK_STATUS_SEG=""
+_HOOK_STATUS_FILE="${HOME}/.claude/.hook-status-${PPID}"
+if [[ -f "$_HOOK_STATUS_FILE" && ! -L "$_HOOK_STATUS_FILE" ]]; then
+  _hook_text=$(head -c 128 "$_HOOK_STATUS_FILE" 2>/dev/null | tr -d '\000-\037\177')
+  [[ -n "$_hook_text" ]] && HOOK_STATUS_SEG=" ${C_DIM}│${RST} ${C_TEAL}${_hook_text}${RST}"
+fi
+
 # ── Vim mode ─────────────────────────────────────────────────
 VIM_SEG=""
 if [[ -n "$VIM_MODE" ]]; then
@@ -324,10 +384,8 @@ if [[ -n "$VIM_MODE" ]]; then
   esac
 fi
 
-# ── Session / worktree ───────────────────────────────────────
-SESSION_SEG=""
-[[ -n "$SESSION_NAME" ]] && SESSION_SEG=" ${C_DIM}│${RST} ${C_PINK}${SESSION_NAME}${RST}"
-
+# ── Worktree ─────────────────────────────────────────────────
+# Session name intentionally omitted – duplicated by tmux tab name + CC title.
 WORKTREE_SEG=""
 if [[ -n "$WORKTREE_NAME" ]]; then
   WORKTREE_SEG=" ${C_DIM}│${RST} ${C_ORANGE}⎇ ${WORKTREE_NAME}${RST}"
@@ -354,14 +412,16 @@ CTX_WARN=""
 [[ "$EXCEEDS_200K" == "true" ]] && CTX_WARN="${CTX_WARN} ${C_ORANGE}200k+${RST}"
 CTX_SEG="${C_WHITE}ctx${RST} ${CTX_BAR} ${C_BRIGHT}${CTX_USED}%${RST}${CTX_WARN}"
 
-# ── Tokens ───────────────────────────────────────────────────
-TOK_IN_FMT=$(fmt_tokens "$TOT_IN")
-TOK_OUT_FMT=$(fmt_tokens "$TOT_OUT")
-TOK_SEG="${C_DIM}│${RST} ${C_BLUE}↓${TOK_IN_FMT}${RST} ${C_PURPLE}↑${TOK_OUT_FMT}${RST}"
+# ── Tokens (main session + all subagents recursively) ────────
+TOK_IN_FMT=$(fmt_tokens "$TOT_IN_ALL")
+TOK_OUT_FMT=$(fmt_tokens "$TOT_OUT_ALL")
+SUB_TAG=""
+(( SUB_COUNT > 0 )) && SUB_TAG=" ${C_DIM}+${SUB_COUNT}sa${RST}"
+TOK_SEG="${C_DIM}│${RST} ${C_BLUE}↓${TOK_IN_FMT}${RST} ${C_PURPLE}↑${TOK_OUT_FMT}${RST}${SUB_TAG}"
 
 TOK_SPEED_SEG=""
-if (( API_MS > 0 && TOT_OUT > 0 )); then
-  SPEED=$(( (TOT_OUT * 1000) / API_MS ))
+if (( API_MS > 0 && TOT_OUT_ALL > 0 )); then
+  SPEED=$(( (TOT_OUT_ALL * 1000) / API_MS ))
   TOK_SPEED_SEG=" ${C_DIM}(${SPEED} tok/s)${RST}"
 fi
 
@@ -372,19 +432,10 @@ if (( CACHE_TOTAL > 0 )); then
   CACHE_SEG=" ${C_DIM}│${RST} ${C_CYAN}⚡${CACHE_HIT}% cache${RST}"
 fi
 
-# ── Cost + duration ──────────────────────────────────────────
-COST_FMT=$(printf '$%.2f' "$COST")
+# ── Duration (cost intentionally omitted) ────────────────────
 DUR_FMT=$(fmt_duration "$DURATION_MS")
 API_DUR_FMT=$(fmt_duration "$API_MS")
-
-BURN_SEG=""
-if (( DURATION_MS > 60000 )); then
-  BURN_HR=$(awk -v c="$COST" -v d="$DURATION_MS" 'BEGIN{printf "%.2f", (c / d) * 3600000}')
-  BURN_SEG=" ${C_DIM}(\$${BURN_HR}/h)${RST}"
-fi
-
-COST_SEG="${C_YELLOW}💰 ${COST_FMT}${RST}${BURN_SEG}"
-TIME_SEG="${C_DIM}│${RST} ${C_CYAN}⏱ ${DUR_FMT}${RST} ${C_DIM}(${API_DUR_FMT} api)${RST}"
+TIME_SEG="${C_CYAN}⏱ ${DUR_FMT}${RST} ${C_DIM}(${API_DUR_FMT} api)${RST}"
 
 # ── Lines changed ────────────────────────────────────────────
 LINES_SEG=""
@@ -401,29 +452,33 @@ remaining_color() {
 }
 
 RATE_SEG=""           # rich – with progress bar + reset countdown
-RATE_SEG_COMPACT=""   # compact – just label + colored %
+RATE_SEG_COMPACT=""   # compact – mini bar + colored % + reset countdown
 RL5_INT=""; RL7_INT=""
 if [[ -n "$RL_5H_PCT" ]]; then
   RL5_INT=${RL_5H_PCT%%.*}
   RL5_LEFT=$(pct_remaining "$RL5_INT")
   RL5_BAR=$(pbar_remaining "$RL5_LEFT" 8 dots)
+  RL5_BAR_MINI=$(pbar_remaining "$RL5_LEFT" 4 dots)
   RL5_RESET=$(fmt_reset_time "$RL_5H_RESET")
   RATE_SEG="${C_WHITE}5h${RST} ${RL5_BAR} ${C_BRIGHT}${RL5_LEFT}% left${RST}"
   [[ -n "$RL5_RESET" ]] && RATE_SEG="${RATE_SEG} ${C_DIM}⟳${RL5_RESET}${RST}"
   c=$(remaining_color "$RL5_LEFT")
-  RATE_SEG_COMPACT="${C_WHITE}5h${RST} ${c}${BOLD}${RL5_LEFT}% left${RST}"
+  RATE_SEG_COMPACT="${C_WHITE}5h${RST} ${RL5_BAR_MINI} ${c}${BOLD}${RL5_LEFT}%${RST}"
+  [[ -n "$RL5_RESET" ]] && RATE_SEG_COMPACT="${RATE_SEG_COMPACT} ${C_DIM}⟳${RL5_RESET}${RST}"
 fi
 if [[ -n "$RL_7D_PCT" ]]; then
   RL7_INT=${RL_7D_PCT%%.*}
   RL7_LEFT=$(pct_remaining "$RL7_INT")
   RL7_BAR=$(pbar_remaining "$RL7_LEFT" 8 dots)
+  RL7_BAR_MINI=$(pbar_remaining "$RL7_LEFT" 4 dots)
   RL7_RESET=$(fmt_reset_time "$RL_7D_RESET")
   [[ -n "$RATE_SEG" ]] && RATE_SEG="${RATE_SEG} ${C_DIM}│${RST} "
   RATE_SEG="${RATE_SEG}${C_WHITE}7d${RST} ${RL7_BAR} ${C_BRIGHT}${RL7_LEFT}% left${RST}"
   [[ -n "$RL7_RESET" ]] && RATE_SEG="${RATE_SEG} ${C_DIM}⟳${RL7_RESET}${RST}"
   c=$(remaining_color "$RL7_LEFT")
   [[ -n "$RATE_SEG_COMPACT" ]] && RATE_SEG_COMPACT="${RATE_SEG_COMPACT} "
-  RATE_SEG_COMPACT="${RATE_SEG_COMPACT}${C_WHITE}7d${RST} ${c}${BOLD}${RL7_LEFT}% left${RST}"
+  RATE_SEG_COMPACT="${RATE_SEG_COMPACT}${C_WHITE}7d${RST} ${RL7_BAR_MINI} ${c}${BOLD}${RL7_LEFT}%${RST}"
+  [[ -n "$RL7_RESET" ]] && RATE_SEG_COMPACT="${RATE_SEG_COMPACT} ${C_DIM}⟳${RL7_RESET}${RST}"
 fi
 
 # Compact ctx (no bar) for narrow mode.
@@ -438,32 +493,46 @@ VER_SEG="${C_DIM}v${VERSION}${RST}"
 
 if (( NARROW )); then
   # ── Narrow mode (half-width tmux pane etc.) ──
-  # Trim L1 to the load-bearing bits; drop session name, worktree, vim, version.
-  L1="${MODEL_SEG} ${C_DIM}│${RST} ${DIR_SEG} ${GIT_SEG}"
+  # Three lines so rate limits keep the full bar + countdown treatment.
+  # L1: model │ dir │ git
+  L1="${MODEL_SEG}${CAVEMAN_SEG}${HOOK_STATUS_SEG} ${C_DIM}│${RST} ${DIR_SEG} ${GIT_SEG}"
 
-  # L2 leads with rate limits so "API left" is never clipped, then ctx + tokens + cost.
-  L2=""
-  [[ -n "$RATE_SEG_COMPACT" ]] && L2="${RATE_SEG_COMPACT} ${C_DIM}│${RST} "
-  L2="${L2}${CTX_SEG_COMPACT} ${C_DIM}│${RST} ${C_BLUE}↓${TOK_IN_FMT}${RST} ${C_PURPLE}↑${TOK_OUT_FMT}${RST} ${C_DIM}│${RST} ${C_YELLOW}💰 ${COST_FMT}${RST}"
+  # L2: ctx │ tokens
+  L2="${CTX_SEG_COMPACT} ${C_DIM}│${RST} ${C_BLUE}↓${TOK_IN_FMT}${RST} ${C_PURPLE}↑${TOK_OUT_FMT}${RST}${SUB_TAG}"
+
+  # L3: rate limits (full form – critical signal, deserves real estate)
+  L3_RATE="$RATE_SEG"
 else
-  # Line 1: Model │ Session │ Dir │ Git │ Worktree │ Vim │ Version
-  L1="${MODEL_SEG}${SESSION_SEG}${WORKTREE_SEG} ${C_DIM}│${RST} ${DIR_SEG} ${GIT_SEG}${VIM_SEG} ${C_DIM}│${RST} ${VER_SEG}"
+  # Line 1: Model │ Dir │ Git │ Worktree │ Vim │ Version
+  L1="${MODEL_SEG}${CAVEMAN_SEG}${HOOK_STATUS_SEG}${WORKTREE_SEG} ${C_DIM}│${RST} ${DIR_SEG} ${GIT_SEG}${VIM_SEG} ${C_DIM}│${RST} ${VER_SEG}"
 
-  # Line 2: Context │ Tokens │ Cache │ Cost │ Time │ Lines │ Rate limits
-  L2="${CTX_SEG} ${TOK_SEG}${TOK_SPEED_SEG}${CACHE_SEG} ${C_DIM}│${RST} ${COST_SEG} ${TIME_SEG}${LINES_SEG}"
+  # Line 2: Context │ Tokens │ Cache │ Time │ Lines │ Rate limits
+  L2="${CTX_SEG} ${TOK_SEG}${TOK_SPEED_SEG}${CACHE_SEG} ${C_DIM}│${RST} ${TIME_SEG}${LINES_SEG}"
   [[ -n "$RATE_SEG" ]] && L2="${L2} ${C_DIM}│${RST} ${RATE_SEG}"
+  L3_RATE=""
 fi
 
-# Line 3 (conditional): Running agents │ Task progress
+# Optional extra line: in narrow mode this is the rate-limits line; in
+# wide mode it's running agents + task progress (with rate limits already
+# embedded in L2).
 L3=""
+if [[ -n "$L3_RATE" ]]; then
+  L3="$L3_RATE"
+fi
 if [[ -n "$AGENT_DISPLAY" || -n "$TASK_DISPLAY" ]]; then
-  L3="${AGENT_DISPLAY}${SUBAGENT_EXTRA}"
-  [[ -n "$AGENT_DISPLAY" && -n "$TASK_DISPLAY" ]] && L3="${L3} ${C_DIM}│${RST} "
-  L3="${L3}${TASK_DISPLAY}"
+  AGENTS_LINE="${AGENT_DISPLAY}${SUBAGENT_EXTRA}"
+  [[ -n "$AGENT_DISPLAY" && -n "$TASK_DISPLAY" ]] && AGENTS_LINE="${AGENTS_LINE} ${C_DIM}│${RST} "
+  AGENTS_LINE="${AGENTS_LINE}${TASK_DISPLAY}"
+  if [[ -n "$L3" ]]; then
+    L4="$AGENTS_LINE"
+  else
+    L3="$AGENTS_LINE"
+  fi
 fi
 
 printf '%s\n' "$L1"
 printf '%s\n' "$L2"
 [[ -n "$L3" ]] && printf '%s\n' "$L3"
+[[ -n "${L4:-}" ]] && printf '%s\n' "$L4"
 
 exit 0
