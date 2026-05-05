@@ -1,7 +1,13 @@
 #!/bin/bash
 # ╔══════════════════════════════════════════════════════════════╗
 # ║  Claude Code Powerline v2 – with agent tracking + fixes      ║
+# ║  Auto-wraps segments onto continuation lines when the budget ║
+# ║  is exceeded. Override safety margin via CC_STATUSLINE_MARGIN ║
+# ║  (default 4 cols, accounts for Claude Code chat-box chrome). ║
 # ╚══════════════════════════════════════════════════════════════╝
+
+# UTF-8 char counting for ${#var}
+LC_CTYPE=C.UTF-8
 
 input=$(cat)
 
@@ -52,8 +58,10 @@ fi
 [[ "${COLS:-0}" =~ ^[0-9]+$ ]] || COLS=0
 (( COLS <= 0 )) && COLS=${COLUMNS:-0}
 (( COLS <= 0 )) && COLS=$(tput cols 2>/dev/null || echo 120)
-NARROW=0
-(( COLS < 100 )) && NARROW=1
+MARGIN=${CC_STATUSLINE_MARGIN:-4}
+[[ "$MARGIN" =~ ^[0-9]+$ ]] || MARGIN=4
+BUDGET=$(( COLS - MARGIN ))
+(( BUDGET < 20 )) && BUDGET=20
 
 # ── Pre-expanded ANSI codes (safe for printf %s) ────────────
 fg()  { printf '\x1b[38;2;%d;%d;%dm' "$1" "$2" "$3"; }
@@ -73,6 +81,31 @@ C_DIM=$(fg 100 100 120)
 C_WHITE=$(fg 200 200 210)
 C_BRIGHT=$(fg 230 230 240)
 C_TEAL=$(fg 80 200 180)
+
+# ── Visible width (strip ANSI, count display columns) ───────
+# Pure-bash, no subprocess. ASCII = 1 col, common emoji we use = 2 cols.
+vis_width() {
+  local s=$1 out=""
+  while [[ "$s" == *$'\x1b['* ]]; do
+    out+="${s%%$'\x1b['*}"
+    s="${s#*$'\x1b['}"
+    while [[ -n "$s" ]]; do
+      local c=${s:0:1}
+      s=${s:1}
+      [[ "$c" == [a-zA-Z] ]] && break
+    done
+  done
+  out+="$s"
+  local n=${#out}
+  local wide_chars="📁📚📋⚙🔍📐🤖📖📊✨⚠⏱⚡⟐"
+  local i ch rest
+  for (( i=0; i<${#wide_chars}; i++ )); do
+    ch=${wide_chars:i:1}
+    rest=$out
+    while [[ "$rest" == *"$ch"* ]]; do n=$((n+1)); rest="${rest#*"$ch"}"; done
+  done
+  printf '%d' "$n"
+}
 
 # ── Progress bar ─────────────────────────────────────────────
 pbar() {
@@ -191,8 +224,7 @@ for f in "$HOME/.claude"/tool-activity-*.log; do
   if kill -0 "$pid" 2>/dev/null; then
     [[ "$(cat /proc/$pid/comm 2>/dev/null)" == "node" ]] && continue
   fi
-  rm -f "$f" "$HOME/.claude/tool-activity-${pid}.session" \
-        "$HOME/.claude/.hook-status-${pid}" 2>/dev/null
+  rm -f "$f" "$HOME/.claude/tool-activity-${pid}.session" 2>/dev/null
 done
 
 if [[ -f "$ACTIVITY_LOG" ]]; then
@@ -368,7 +400,8 @@ fi
 # Hooks write ~/.claude/.hook-status-$PPID with a short display string.
 # This section is generic — the hook controls what text is shown.
 HOOK_STATUS_SEG=""
-_HOOK_STATUS_FILE="${HOME}/.claude/.hook-status-${PPID}"
+_STATUS_KEY="${TMUX_PANE:-default}"; _STATUS_KEY="${_STATUS_KEY//[^a-zA-Z0-9]/_}"
+_HOOK_STATUS_FILE="${HOME}/.claude/.hook-status-${_STATUS_KEY}"
 if [[ -f "$_HOOK_STATUS_FILE" && ! -L "$_HOOK_STATUS_FILE" ]]; then
   _hook_text=$(head -c 128 "$_HOOK_STATUS_FILE" 2>/dev/null | tr -d '\000-\037\177')
   [[ -n "$_hook_text" ]] && HOOK_STATUS_SEG=" ${C_DIM}│${RST} ${C_TEAL}${_hook_text}${RST}"
@@ -488,51 +521,115 @@ CTX_SEG_COMPACT="${C_WHITE}ctx${RST} ${C_BRIGHT}${BOLD}${CTX_USED}%${RST}${CTX_W
 VER_SEG="${C_DIM}v${VERSION}${RST}"
 
 # ═══════════════════════════════════════════════════════════════
-# ── Assemble (printf %s – no escape interpretation on data) ──
+# ── Bare-segment derivation (strip leading separators) ─────────
 # ═══════════════════════════════════════════════════════════════
+# The packer adds separators between segments based on a per-segment
+# "join hint", so each segment must be content-only.
 
-if (( NARROW )); then
-  # ── Narrow mode (half-width tmux pane etc.) ──
-  # Three lines so rate limits keep the full bar + countdown treatment.
-  # L1: model │ dir │ git
-  L1="${MODEL_SEG}${CAVEMAN_SEG}${HOOK_STATUS_SEG} ${C_DIM}│${RST} ${DIR_SEG} ${GIT_SEG}"
+_LEAD1=" ${C_DIM}│${RST} "   # prefix on HOOK/WORKTREE/CACHE/LINES
+_LEAD2="${C_DIM}│${RST} "    # prefix on GIT/TOK (no leading space)
 
-  # L2: ctx │ tokens
-  L2="${CTX_SEG_COMPACT} ${C_DIM}│${RST} ${C_BLUE}↓${TOK_IN_FMT}${RST} ${C_PURPLE}↑${TOK_OUT_FMT}${RST}${SUB_TAG}"
+HOOK_BARE="${HOOK_STATUS_SEG#"$_LEAD1"}"
+WORKTREE_BARE="${WORKTREE_SEG#"$_LEAD1"}"
+CACHE_BARE="${CACHE_SEG#"$_LEAD1"}"
+LINES_BARE="${LINES_SEG#"$_LEAD1"}"
+GIT_BARE="${GIT_SEG#"$_LEAD2"}"
+TOK_BARE="${TOK_SEG#"$_LEAD2"}${TOK_SPEED_SEG}"
 
-  # L3: rate limits (full form – critical signal, deserves real estate)
-  L3_RATE="$RATE_SEG"
-else
-  # Line 1: Model │ Dir │ Git │ Worktree │ Vim │ Version
-  L1="${MODEL_SEG}${CAVEMAN_SEG}${HOOK_STATUS_SEG}${WORKTREE_SEG} ${C_DIM}│${RST} ${DIR_SEG} ${GIT_SEG}${VIM_SEG} ${C_DIM}│${RST} ${VER_SEG}"
+# Identity badge: model + caveman are glued (no separator); hook + worktree
+# follow with a bar. Fold them into one logical "model" segment so they
+# stay together when a row wraps.
+MODEL_BADGE="${MODEL_SEG}${CAVEMAN_SEG}"
+[[ -n "$HOOK_BARE"     ]] && MODEL_BADGE="${MODEL_BADGE} ${C_DIM}│${RST} ${HOOK_BARE}"
+[[ -n "$WORKTREE_BARE" ]] && MODEL_BADGE="${MODEL_BADGE} ${C_DIM}│${RST} ${WORKTREE_BARE}"
 
-  # Line 2: Context │ Tokens │ Cache │ Time │ Lines │ Rate limits
-  L2="${CTX_SEG} ${TOK_SEG}${TOK_SPEED_SEG}${CACHE_SEG} ${C_DIM}│${RST} ${TIME_SEG}${LINES_SEG}"
-  [[ -n "$RATE_SEG" ]] && L2="${L2} ${C_DIM}│${RST} ${RATE_SEG}"
-  L3_RATE=""
-fi
+# Dir+git+vim are also glued (vim is a small mode indicator that follows git).
+DIR_GIT_BADGE="${DIR_SEG}"
+[[ -n "$GIT_BARE" ]] && DIR_GIT_BADGE="${DIR_GIT_BADGE} ${GIT_BARE}"
+DIR_GIT_BADGE="${DIR_GIT_BADGE}${VIM_SEG}"
 
-# Optional extra line: in narrow mode this is the rate-limits line; in
-# wide mode it's running agents + task progress (with rate limits already
-# embedded in L2).
-L3=""
-if [[ -n "$L3_RATE" ]]; then
-  L3="$L3_RATE"
-fi
+# Agents + tasks
+AGENTS_BARE=""
 if [[ -n "$AGENT_DISPLAY" || -n "$TASK_DISPLAY" ]]; then
-  AGENTS_LINE="${AGENT_DISPLAY}${SUBAGENT_EXTRA}"
-  [[ -n "$AGENT_DISPLAY" && -n "$TASK_DISPLAY" ]] && AGENTS_LINE="${AGENTS_LINE} ${C_DIM}│${RST} "
-  AGENTS_LINE="${AGENTS_LINE}${TASK_DISPLAY}"
-  if [[ -n "$L3" ]]; then
-    L4="$AGENTS_LINE"
-  else
-    L3="$AGENTS_LINE"
-  fi
+  AGENTS_BARE="${AGENT_DISPLAY}${SUBAGENT_EXTRA}"
+  [[ -n "$AGENT_DISPLAY" && -n "$TASK_DISPLAY" ]] && AGENTS_BARE="${AGENTS_BARE} ${C_DIM}│${RST} "
+  AGENTS_BARE="${AGENTS_BARE}${TASK_DISPLAY}"
 fi
 
-printf '%s\n' "$L1"
-printf '%s\n' "$L2"
-[[ -n "$L3" ]] && printf '%s\n' "$L3"
-[[ -n "${L4:-}" ]] && printf '%s\n' "$L4"
+# ═══════════════════════════════════════════════════════════════
+# ── Packer ─────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════
+# Packs an ordered list of segments into 1+ physical lines, wrapping
+# whenever the running width would exceed BUDGET. Falls back to a
+# compact variant before wrapping when one is provided.
+#
+# Inputs: parallel arrays passed by name —
+#   _SEPS     : separator to prepend when not first on a line
+#   _TEXTS    : full segment text
+#   _COMPACTS : optional compact variant (may be empty)
+
+SEP_BAR=" ${C_DIM}│${RST} "
+
+pack_group() {
+  local -n _seps=$1 _texts=$2 _compacts=$3
+  local n=${#_texts[@]} i
+  local cur="" cur_w=0
+  local sep full cmp sw fw cw
+  for ((i=0; i<n; i++)); do
+    full="${_texts[i]}"
+    [[ -z "$full" ]] && continue
+    sep="${_seps[i]}"
+    cmp="${_compacts[i]}"
+    [[ -z "$cur" ]] && sep=""
+    sw=$(vis_width "$sep")
+    fw=$(vis_width "$full")
+    if (( cur_w + sw + fw <= BUDGET )); then
+      cur+="${sep}${full}"; cur_w=$((cur_w + sw + fw)); continue
+    fi
+    if [[ -n "$cmp" ]]; then
+      cw=$(vis_width "$cmp")
+      if (( cur_w + sw + cw <= BUDGET )); then
+        cur+="${sep}${cmp}"; cur_w=$((cur_w + sw + cw)); continue
+      fi
+    fi
+    # Wrap: flush current line, start a new line. Prefer compact when available
+    # so an oversize segment still gets shrunk on its own line.
+    [[ -n "$cur" ]] && printf '%s\n' "$cur"
+    # On a fresh line: prefer full if it fits, else compact (even if compact also overflows).
+    if (( fw <= BUDGET )); then
+      cur="$full"; cur_w=$fw
+    elif [[ -n "$cmp" ]]; then
+      cw=$(vis_width "$cmp")
+      cur="$cmp"; cur_w=$cw
+    else
+      cur="$full"; cur_w=$fw
+    fi
+  done
+  [[ -n "$cur" ]] && printf '%s\n' "$cur"
+}
+
+# ── Group 1: identity row ────────────────────────────────────
+G1_SEPS=();    G1_TEXTS=();        G1_COMPACTS=()
+G1_SEPS+=("");        G1_TEXTS+=("$MODEL_BADGE");   G1_COMPACTS+=("")
+G1_SEPS+=("$SEP_BAR");G1_TEXTS+=("$DIR_GIT_BADGE"); G1_COMPACTS+=("")
+G1_SEPS+=("$SEP_BAR");G1_TEXTS+=("$VER_SEG");       G1_COMPACTS+=("")
+
+# ── Group 2: usage row ───────────────────────────────────────
+G2_SEPS=();    G2_TEXTS=();        G2_COMPACTS=()
+G2_SEPS+=("");        G2_TEXTS+=("$CTX_SEG");   G2_COMPACTS+=("$CTX_SEG_COMPACT")
+G2_SEPS+=("$SEP_BAR");G2_TEXTS+=("$TOK_BARE");  G2_COMPACTS+=("")
+[[ -n "$CACHE_BARE" ]] && { G2_SEPS+=("$SEP_BAR"); G2_TEXTS+=("$CACHE_BARE"); G2_COMPACTS+=(""); }
+G2_SEPS+=("$SEP_BAR");G2_TEXTS+=("$TIME_SEG");  G2_COMPACTS+=("")
+[[ -n "$LINES_BARE" ]] && { G2_SEPS+=("$SEP_BAR"); G2_TEXTS+=("$LINES_BARE"); G2_COMPACTS+=(""); }
+[[ -n "$RATE_SEG"   ]] && { G2_SEPS+=("$SEP_BAR"); G2_TEXTS+=("$RATE_SEG");   G2_COMPACTS+=("$RATE_SEG_COMPACT"); }
+
+# ── Group 3: activity row (optional) ─────────────────────────
+G3_SEPS=();    G3_TEXTS=();        G3_COMPACTS=()
+[[ -n "$AGENTS_BARE" ]] && { G3_SEPS+=(""); G3_TEXTS+=("$AGENTS_BARE"); G3_COMPACTS+=(""); }
+
+# ── Output ───────────────────────────────────────────────────
+pack_group G1_SEPS G1_TEXTS G1_COMPACTS
+pack_group G2_SEPS G2_TEXTS G2_COMPACTS
+(( ${#G3_TEXTS[@]} > 0 )) && pack_group G3_SEPS G3_TEXTS G3_COMPACTS
 
 exit 0
